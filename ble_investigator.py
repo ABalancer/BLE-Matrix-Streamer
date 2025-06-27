@@ -47,7 +47,7 @@ async def write(bleak_client, characteristic_uuid):
             byte_values.append(byte)
         else:
             not_byte_flag = True
-    if not_byte_flag is False:
+    if not not_byte_flag:
         await bleak_client.write_gatt_char(characteristic_uuid, bytearray(byte_values))
         print("Write complete")
     else:
@@ -84,6 +84,7 @@ async def nonblocking_wait_for_input():
 
     def wait_for_enter():
         input()
+        # noinspection PyTypeChecker
         loop.call_soon_threadsafe(stop_event.set)
 
     threading.Thread(target=wait_for_enter, daemon=True).start()

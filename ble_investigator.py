@@ -7,7 +7,6 @@ import struct
 
 '''
 TODO: 
-    Test write
     Test multiple access properties
     Alter the program to be interacted with in a terminal
 '''
@@ -44,7 +43,7 @@ async def write(bleak_client, characteristic_uuid):
     for byte_string in byte_strings:
         byte = is_byte(byte_string)
         if byte:
-            byte_values.append(byte)
+            byte_values.append(int(byte_string, 16))
         else:
             not_byte_flag = True
     if not not_byte_flag:

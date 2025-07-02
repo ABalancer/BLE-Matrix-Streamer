@@ -101,7 +101,7 @@ class Matrix(tk.Canvas):
 
     def _check_matrix_size(self, matrix):
         if len(matrix) == self._rows:
-            if len(matrix[15]) == self._columns:
+            if len(matrix[self._rows - 1]) == self._columns:
                 return True
         print("Matrix data did not match with the expected size")
         return False

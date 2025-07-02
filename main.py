@@ -1,14 +1,13 @@
-import tkinter as tk
-import numpy as np
-import random
 import time
 import struct
+import asyncio
+import threading
+import numpy as np
+import tkinter as tk
 from tkinter import ttk
 from tkinter import font
-import threading
-import asyncio
-from bleak import BleakScanner
 from bleak import BleakClient
+from bleak import BleakScanner
 
 from matrix import Matrix
 
@@ -20,8 +19,6 @@ MATRIX_DIMENSIONS_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1624").lower(
 MATRIX_DATA_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1625").lower()
 SCAN_TIME = 10
 GRID_SIZE = 500
-rows = 3
-cols = 3
 
 
 def remap_matrix(matrix, threshold):
@@ -65,14 +62,11 @@ def decode_matrix_dimensions(byte_array):
     return num_of_cols, num_of_rows
 
 
-def decode_matrix_data(num_rows, num_cols, byte_array):
-    # Assuming each element is a 12-bit unsigned integer (2 bytes)
-    element_size = 2
-
+def decode_matrix_data(byte_array, rows, columns):
     # Unpack the byte array into a flat list of integers
-    unpacked_matrix_data = struct.unpack('<' + 'H' * (len(byte_array) // element_size), byte_array)
+    unpacked_matrix_data = struct.unpack("<" + (rows * columns * "B"), byte_array)
     # Reshape the flat list into a 2D matrix
-    matrix_data = [unpacked_matrix_data[i:i+num_rows] for i in range(0, len(unpacked_matrix_data), num_cols)]
+    matrix_data = [unpacked_matrix_data[i:i + rows] for i in range(0, len(unpacked_matrix_data), columns)]
 
     return matrix_data
 
@@ -96,18 +90,16 @@ class App:
         self.matrix_canvas = None
         self.heat_canvas = None
         self.grid = None
-
-        # Activities
-        self.activities_frame = create_widget(self.root, tk.Frame)
-        self.activities_frame.grid(row=2, column=0, sticky="we")
-        self.activities_frame.columnconfigure((0, 1, 2), weight=1)
-
-        self.activity_label = create_widget(self.activities_frame, tk.Label, text="Activities:")
-        self.activity_label.grid(row=0, column=0, columnspan=3, sticky="w")
+        self.grid_canvas_size = GRID_SIZE
+        self._start_time = None
+        self._number_of_rows = None
+        self._number_of_columns = None
+        self._data_format = None
+        self._update_matrix = False
 
         # BLE Box
         self.ble_frame = create_widget(self.root, tk.Frame)
-        self.ble_frame.grid(row=3, column=0, sticky="we")
+        self.ble_frame.grid(row=0, column=0, sticky="we")
         self.ble_frame.columnconfigure((0, 1, 2), weight=1)
 
         self.ble_label = create_widget(self.ble_frame, tk.Label, text="BLE Devices:")
@@ -116,10 +108,12 @@ class App:
         self.devices_listbox = create_widget(self.ble_frame, tk.Listbox)
         self.devices_listbox.grid(row=1, column=0, columnspan=3, stick="nsew")
 
-        self.search_button = create_widget(self.ble_frame, tk.Button, text="Search", command=self.search_button_callback)
+        self.search_button = create_widget(self.ble_frame, tk.Button,
+                                           text="Search", command=self.search_button_callback)
         self.search_button.grid(row=2, column=0)
 
-        self.connect_button = create_widget(self.ble_frame, tk.Button, text="Connect", command=self.connect_button_callback)
+        self.connect_button = create_widget(self.ble_frame, tk.Button,
+                                            text="Connect", command=self.connect_button_callback)
         self.connect_button.grid(row=2, column=1)
 
         self.disconnect_button = create_widget(self.ble_frame, tk.Button, text="Disconnect",
@@ -129,8 +123,6 @@ class App:
 
         # Initialise certain states
         self.connect_disconnect_buttons_state(False)
-
-        self.create_matrix(rows, cols, GRID_SIZE)
 
     def run(self):
         self.root.mainloop()
@@ -158,7 +150,7 @@ class App:
 
     # Async function used within thread to start bleak scanner
     async def _ble_scan_devices(self):
-        async with BleakScanner(detection_callback=self._device_detection_callback):
+        async with BleakScanner(detection_callback=self._device_detection_callback, return_adv=True):
             await asyncio.sleep(SCAN_TIME)
             # noinspection PyTypeChecker
             self.root.after(0, lambda: self.search_button.config(state=tk.NORMAL))
@@ -173,7 +165,7 @@ class App:
                 allow_connection = False
             self.devices[0].append(device.address)
             self.devices[1].append(allow_connection)
-            device_string = "{:<20} : {}".format(str(device.name), device.address)
+            device_string = "{:<25} : {}".format(str(device.name), device.address)
             self.root.after(0, self.devices_listbox.insert, tk.END, device_string)
 
     # Function to connect to device
@@ -190,41 +182,40 @@ class App:
                 self.stay_connected = client.is_connected
 
                 matrix_dimensions = await client.read_gatt_char(MATRIX_DIMENSIONS_CHARACTERISTIC_UUID)
-                number_of_rows, number_of_columns = decode_matrix_dimensions(matrix_dimensions)
-                self.root.after(0, self._create_matrix, number_of_rows, number_of_columns)
-
+                self._number_of_rows, self._number_of_columns = decode_matrix_dimensions(matrix_dimensions)
+                self.root.after(0, self.create_matrix, self._number_of_rows, self._number_of_columns)
+                self._start_time = time.time()
                 await client.start_notify(MATRIX_DATA_CHARACTERISTIC_UUID, self._notification_handler_callback)
 
                 while self.stay_connected:
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.02)
+                    if time.time() - self._start_time >= 0.1:
+                        self._update_matrix = True
+
                 if client.is_connected:
                     await client.stop_notify(MATRIX_DATA_CHARACTERISTIC_UUID)
                     await client.disconnect()
                     self.root.after(0, self.connect_disconnect_buttons_state, self.stay_connected)
+                    # noinspection PyTypeChecker
+                    self.root.after(0, self.destroy_matrix)
         except Exception as e:
             print("Connection Failed. Error: {}".format(e))
             self.root.after(0, self.connect_disconnect_buttons_state, False)
+            # noinspection PyTypeChecker
+            self.root.after(0, self.destroy_matrix)
 
     # noinspection PyUnusedLocal
     def _notification_handler_callback(self, sender, data):
-        print(struct.unpack("<9H", data))
-
-    def _create_matrix(self, rows, columns):
-        print("create_matrix")
-
-    # Recursive Loop for updating the matrix when connected to device
-    def _map_updater_task(self, queue, process):
-        if process.is_alive():
-            matrix_data = queue.get()
-            if matrix_data:
-                matrix_data = remap_matrix(matrix_data, 2048)
-                matrix_colours = self.grid.match_colours(matrix_data)
-                self.grid.update_matrix(matrix_colours)
-                # self.grid.plot_centre_of_pressure(matrix_data)
-
-            self.root.after(5, self._map_updater_task, queue, process)
-        else:
-            self.connect_disconnect_buttons_state(False)
+        matrix_data = decode_matrix_data(data, self._number_of_rows, self._number_of_columns)
+        print(matrix_data)
+        # matrix_data = remap_matrix(matrix_data, 2048)
+        if self._update_matrix:
+            print("Updating Matrix Display")
+            self._update_matrix = False
+            matrix_colours = self.matrix_canvas.match_colours(matrix_data)
+            self.matrix_canvas.update_matrix(matrix_colours)
+            # self.grid.plot_centre_of_pressure(matrix_data)
+            self._start_time = time.time()
 
     # Function to disconnect from the connected device
     def disconnect_button_callback(self):
@@ -236,17 +227,23 @@ class App:
         self.search_button.config(state=tk.DISABLED if state else tk.NORMAL)
         self.disconnect_button.config(state=tk.NORMAL if state else tk.DISABLED)
 
-    def create_matrix(self, rows, columns, grid_size):
+    def create_matrix(self, rows, columns):
         # Canvas matrix grid
-        self.matrix_canvas = create_widget(self.root, Matrix, rows=rows, columns=columns, size=grid_size,
+        self.matrix_canvas = create_widget(self.root, Matrix, rows=rows, columns=columns, size=self.grid_canvas_size,
                                            borderwidth=0)
         self.matrix_canvas.draw()
 
         self.heat_canvas = create_widget(self.root, tk.Canvas,
-                                         width=grid_size, height=25)
-        self.create_heatmap_scale(grid_size, 25, self.matrix_canvas.get_colour_map())
-        self.heat_canvas.grid(row=0, column=0)
-        self.matrix_canvas.grid(row=1, column=0)
+                                         width=self.grid_canvas_size, height=25)
+        self.create_heatmap_scale(self.grid_canvas_size, 25, self.matrix_canvas.get_colour_map())
+        self.heat_canvas.grid(row=1, column=0)
+        self.matrix_canvas.grid(row=2, column=0)
+
+    def destroy_matrix(self):
+        if self.matrix_canvas.winfo_exists():
+            self.matrix_canvas.destroy()
+        if self.heat_canvas.winfo_exists():
+            self.heat_canvas.destroy()
 
 
 if __name__ == "__main__":

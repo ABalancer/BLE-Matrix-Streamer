@@ -4,6 +4,8 @@ import asyncio
 import multiprocessing
 import struct
 
+# Deprecated
+
 
 def decode_matrix_data(num_rows, num_cols, byte_array):
     # Assuming each element is a 12-bit unsigned integer (2 bytes)
@@ -39,9 +41,9 @@ def process_handler(target, args):
 
 
 # Function to update the listbox with detected devices
-async def device_scanner(queue, lock, data_availability):
+async def device_scanner(queue, lock, data_availability, desired_service_uuid):
     try:
-        devices = await BleakScanner.discover()
+        devices = await BleakScanner(service_uuids=desired_service_uuid).discover()
         if devices:
             devices_2d = []
             for device in devices:

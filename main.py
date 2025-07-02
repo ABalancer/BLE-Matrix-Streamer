@@ -9,6 +9,7 @@ import threading
 import asyncio
 from bleak import BleakScanner
 from bleak import BleakClient
+
 from matrix import Matrix
 
 
@@ -18,9 +19,9 @@ MATRIX_SERVICE_UUID = BASE_UUID.replace("XXXX", "1623").lower()
 MATRIX_DIMENSIONS_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1624").lower()
 MATRIX_DATA_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1625").lower()
 SCAN_TIME = 10
-GRID_SIZE = 16
-GRID_HEIGHT = 500
-GRID_WIDTH = 500
+GRID_SIZE = 500
+rows = 3
+cols = 3
 
 
 def remap_matrix(matrix, threshold):
@@ -36,7 +37,7 @@ def create_widget(parent, widget_type, *args, **kwargs):
 
     widget.config(background="#2b2b2b", borderwidth=0, relief=tk.FLAT)
     # Apply the styling based on the current mode (light/dark)
-    if widget_type is tk.Canvas:
+    if widget_type is tk.Canvas or widget_type is Matrix:
         widget.config(highlightthickness=0)
     if widget_type is tk.Label or widget_type is tk.Listbox or widget_type is tk.Button:
         available_fonts = font.families()
@@ -92,16 +93,9 @@ class App:
         self.root.iconbitmap("icon.ico")
         self.root.protocol("WM_DELETE_WINDOW", self._exit)
 
-        # Canvas matrix grid
-        self.matrix_canvas = create_widget(self.root, tk.Canvas, width=GRID_WIDTH, height=GRID_HEIGHT, borderwidth=0)
-        self.matrix_canvas.grid(row=0, column=0)
-
-        self.grid = Matrix(self.matrix_canvas, rows=GRID_SIZE, columns=GRID_SIZE)
-        self.grid.draw()
-
-        self.heat_canvas = create_widget(self.root, tk.Canvas, width=GRID_WIDTH, height=25)
-        self.heat_canvas.grid(row=1, column=0)
-        self.create_heatmap_scale(GRID_WIDTH, 25, self.grid.colour_map)
+        self.matrix_canvas = None
+        self.heat_canvas = None
+        self.grid = None
 
         # Activities
         self.activities_frame = create_widget(self.root, tk.Frame)
@@ -135,6 +129,8 @@ class App:
 
         # Initialise certain states
         self.connect_disconnect_buttons_state(False)
+
+        self.create_matrix(rows, cols, GRID_SIZE)
 
     def run(self):
         self.root.mainloop()
@@ -239,6 +235,18 @@ class App:
         self.connect_button.config(state=tk.DISABLED if state else tk.NORMAL)
         self.search_button.config(state=tk.DISABLED if state else tk.NORMAL)
         self.disconnect_button.config(state=tk.NORMAL if state else tk.DISABLED)
+
+    def create_matrix(self, rows, columns, grid_size):
+        # Canvas matrix grid
+        self.matrix_canvas = create_widget(self.root, Matrix, rows=rows, columns=columns, size=grid_size,
+                                           borderwidth=0)
+        self.matrix_canvas.draw()
+
+        self.heat_canvas = create_widget(self.root, tk.Canvas,
+                                         width=grid_size, height=25)
+        self.create_heatmap_scale(grid_size, 25, self.matrix_canvas.get_colour_map())
+        self.heat_canvas.grid(row=0, column=0)
+        self.matrix_canvas.grid(row=1, column=0)
 
 
 if __name__ == "__main__":

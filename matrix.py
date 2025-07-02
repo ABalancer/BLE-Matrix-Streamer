@@ -1,3 +1,4 @@
+import tkinter as tk
 import numpy as np
 
 
@@ -41,49 +42,51 @@ def create_colourmap():
     return colour_array
 
 
-class Matrix:
-    def __init__(self, canvas, rows, columns):
-        self.canvas = canvas
-        self.rows = rows
-        self.columns = columns
-        self.canvas_width = canvas.winfo_reqwidth()
-        self.canvas_height = canvas.winfo_reqheight()
-        self.pc_x_pos = self.canvas_width / 2
-        self.pc_y_pos = self.canvas_height / 2
-        self.cell_width = self.canvas_width // columns
-        self.cell_height = self.canvas_height // rows
-        self.rectangles = []
-        self.colour_map = create_colourmap()
-        self.base_of_support_lines = None
-        self.target_circle = None
-        self.pressure_circle = None
-        self.draw()
+class Matrix(tk.Canvas):
+    def __init__(self, parent, rows, columns, size, **kwargs):
+        if rows > columns:
+            box_size = (size - 1) / rows
+        else:
+            box_size = (size - 1) / columns
+        super().__init__(parent, width=round(box_size * columns) + 1, height=round(box_size * rows) + 1, **kwargs)
+        self._rows = rows
+        self._columns = columns
+        self._canvas_width = int(self.cget("width"))
+        self._canvas_height = int(self.cget("height"))
+        self._pc_x_pos = self._canvas_width / 2
+        self._pc_y_pos = self._canvas_height / 2
+        self._cell_width = box_size
+        self._cell_height = box_size
+        self._rectangles = []
+        self._colour_map = create_colourmap()
+        self._base_of_support_lines = None
+        self._target_circle = None
+        self._pressure_circle = None
 
     def draw(self):
-        for row in range(self.rows):
-            for col in range(self.columns):
-                x1 = col * self.cell_width + 1
-                y1 = row * self.cell_height + 1
-                x2 = x1 + self.cell_width
-                y2 = y1 + self.cell_height
+        for row in range(self._rows):
+            for col in range(self._columns):
+                x1 = col * self._cell_width
+                y1 = row * self._cell_height
+                x2 = x1 + self._cell_width
+                y2 = y1 + self._cell_height
+                rectangle = self.create_rectangle(x1, y1, x2, y2, outline="#777777")
+                self._rectangles.append(rectangle)
 
-                rectangle = self.canvas.create_rectangle(x1, y1, x2, y2, outline="#777777")
-                self.rectangles.append(rectangle)
-
-        self.pressure_circle = self.canvas.create_oval(self.canvas_width / 2 - 5, self.canvas_height / 2 - 5,
-                                                       self.canvas_width / 2 + 5, self.canvas_height / 2 + 5,
-                                                       fill="white", outline="", state="hidden", tag="pressure_circle")
+        self._pressure_circle = self.create_oval(self._canvas_width / 2 - 5, self._canvas_height / 2 - 5,
+                                                 self._canvas_width / 2 + 5, self._canvas_height / 2 + 5,
+                                                 fill="white", outline="", state="hidden", tag="pressure_circle")
 
     def edit_rectangle(self, row, col, color):
-        index = row * self.columns + col
-        if 0 <= index < len(self.rectangles):
-            self.canvas.itemconfig(self.rectangles[index], fill=color)
+        index = row * self._columns + col
+        if 0 <= index < len(self._rectangles):
+            self.itemconfig(self._rectangles[index], fill=color)
 
     def match_colours(self, matrix_data):
         # Map each value in the matrix to a color
         if self._check_matrix_size(matrix_data):
             try:
-                colour_matrix = [[self.colour_map[value] for value in row] for row in matrix_data]
+                colour_matrix = [[self._colour_map[value] for value in row] for row in matrix_data]
                 return colour_matrix
             except IndexError:
                 return None
@@ -92,13 +95,13 @@ class Matrix:
 
     def update_matrix(self, colour_matrix):
         if colour_matrix:
-            for row in range(0, self.rows):
-                for column in range(0, self.columns):
+            for row in range(0, self._rows):
+                for column in range(0, self._columns):
                     self.edit_rectangle(row, column, colour_matrix[row][column])
 
     def _check_matrix_size(self, matrix):
-        if len(matrix) == self.rows:
-            if len(matrix[15]) == self.columns:
+        if len(matrix) == self._rows:
+            if len(matrix[15]) == self._columns:
                 return True
         print("Matrix data did not match with the expected size")
         return False
@@ -112,13 +115,19 @@ class Matrix:
             centre_x = np.sum(x * matrix_data) / total_pressure
             centre_y = np.sum(y * matrix_data) / total_pressure
             # print("X: {}, Y: {}".format(centre_x, centre_y))
-            new_centre_x = self.canvas_width * centre_x / (self.rows - 1)
-            new_centre_y = self.canvas_height * centre_y / (self.columns - 1)
-            centre_dx = new_centre_x - self.pc_x_pos
-            centre_dy = new_centre_y - self.pc_y_pos
-            self.pc_x_pos = new_centre_x
-            self.pc_y_pos = new_centre_y
-            self.canvas.move('pressure_circle', centre_dx, centre_dy)
-            self.canvas.itemconfigure('pressure_circle', state='normal')
+            new_centre_x = self._canvas_width * centre_x / (self._rows - 1)
+            new_centre_y = self._canvas_height * centre_y / (self._columns - 1)
+            centre_dx = new_centre_x - self._pc_x_pos
+            centre_dy = new_centre_y - self._pc_y_pos
+            self._pc_x_pos = new_centre_x
+            self._pc_y_pos = new_centre_y
+            self.move('pressure_circle', centre_dx, centre_dy)
+            self.itemconfigure('pressure_circle', state='normal')
         else:
-            self.canvas.itemconfigure('pressure_circle', state='hidden')
+            self.itemconfigure('pressure_circle', state='hidden')
+
+    def get_canvas_dimensions(self):
+        return self._canvas_width, self._canvas_height
+
+    def get_colour_map(self):
+        return self._colour_map

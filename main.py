@@ -75,7 +75,7 @@ class App:
     def __init__(self, name):
         # Variables
         self.stay_connected = False
-        self.devices = [[], []]
+        self._devices = [[], [], []]
 
         # Tkinter
         self.root = tk.Tk()
@@ -143,8 +143,9 @@ class App:
     def search_button_callback(self):
         self.search_button.config(state=tk.DISABLED)
         self.connect_button.config(state=tk.DISABLED)
-        self.devices[0].clear()
-        self.devices[1].clear()
+        self._devices[0].clear()
+        self._devices[1].clear()
+        self._devices[2].clear()
         self.devices_listbox.delete(0, tk.END)
         threading.Thread(target=lambda: asyncio.run(self._ble_scan_devices()), daemon=True).start()
 
@@ -158,23 +159,41 @@ class App:
             self.root.after(0, lambda: self.connect_button.config(state=tk.NORMAL))
 
     def _device_detection_callback(self, device, advertising_data):
-        if device.address not in self.devices[0]:
+        # Updating items after scan response
+        if device.address in self._devices[0]:
+            index = self._devices[0].index(device.address)
+            if self._devices[1][index] is None:
+                # A repeated address may be a scan response, which can include extra data such as the device name
+                # Remove the previous item in the selection box, and place in a new selection with the device name
+                self._devices[1][index] = advertising_data.local_name
+                device_string = " {:<25} : {}".format(str(device.name), device.address)
+                self.root.after(0, self.devices_listbox.delete, index)
+                self.root.after(0, self.devices_listbox.insert, index, device_string)
+                # In the case where the service UUID is in the scan response rather than the initial advertising data
+                if not self._devices[2][index] and MATRIX_SERVICE_UUID in advertising_data.service_uuids:
+                    self._devices[2][index] = True
+        # add details of detected device to self.devices list of lists
+        elif device.address not in self._devices[0]:
             if MATRIX_SERVICE_UUID in advertising_data.service_uuids:
                 allow_connection = True
             else:
                 allow_connection = False
-            self.devices[0].append(device.address)
-            self.devices[1].append(allow_connection)
-            device_string = "{:<25} : {}".format(str(device.name), device.address)
+            self._devices[0].append(device.address)
+            self._devices[1].append(advertising_data.local_name)
+            self._devices[2].append(allow_connection)
+            device_string = " {:<25} : {}".format(str(device.name), device.address)
             self.root.after(0, self.devices_listbox.insert, tk.END, device_string)
 
     # Function to connect to device
     def connect_button_callback(self):
         if self.devices_listbox.size() > 0:
-            self.connect_disconnect_buttons_state(True)
-            selected_address = self.devices[0][self.devices_listbox.curselection()[0]]
-            threading.Thread(target=lambda: asyncio.run(self._ble_connect_stream(selected_address)),
-                             daemon=True).start()
+            if self._devices[2][self.devices_listbox.curselection()[0]]:
+                self.connect_disconnect_buttons_state(True)
+                selected_address = self._devices[0][self.devices_listbox.curselection()[0]]
+                threading.Thread(target=lambda: asyncio.run(self._ble_connect_stream(selected_address)),
+                                 daemon=True).start()
+            else:
+                print("Selected device does not contain the Matrix Service")
 
     async def _ble_connect_stream(self, device_address):
         try:
@@ -188,7 +207,7 @@ class App:
                 await client.start_notify(MATRIX_DATA_CHARACTERISTIC_UUID, self._notification_handler_callback)
 
                 while self.stay_connected:
-                    await asyncio.sleep(0.02)
+                    await asyncio.sleep(0.01)
                     if time.time() - self._start_time >= 0.1:
                         self._update_matrix = True
 
@@ -207,15 +226,13 @@ class App:
     # noinspection PyUnusedLocal
     def _notification_handler_callback(self, sender, data):
         matrix_data = decode_matrix_data(data, self._number_of_rows, self._number_of_columns)
-        print(matrix_data)
-        # matrix_data = remap_matrix(matrix_data, 2048)
         if self._update_matrix:
-            print("Updating Matrix Display")
             self._update_matrix = False
-            matrix_colours = self.matrix_canvas.match_colours(matrix_data)
-            self.matrix_canvas.update_matrix(matrix_colours)
-            # self.grid.plot_centre_of_pressure(matrix_data)
             self._start_time = time.time()
+            # matrix_data = remap_matrix(matrix_data, 2048)
+            matrix_colours = self.matrix_canvas.match_colours(matrix_data)
+            self.root.after(0, self.matrix_canvas.update_matrix, matrix_colours)
+            # self.grid.plot_centre_of_pressure(matrix_data)
 
     # Function to disconnect from the connected device
     def disconnect_button_callback(self):

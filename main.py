@@ -66,16 +66,80 @@ def decode_matrix_data(byte_array, rows, columns):
     # Unpack the byte array into a flat list of integers
     unpacked_matrix_data = struct.unpack("<" + (rows * columns * "B"), byte_array)
     # Reshape the flat list into a 2D matrix
-    matrix_data = [unpacked_matrix_data[i:i + rows] for i in range(0, len(unpacked_matrix_data), columns)]
+    matrix_data = [unpacked_matrix_data[i * columns:(i + 1) * columns] for i in range(rows)]
 
     return matrix_data
+
+
+class BLEFrameAssembler:
+    def __init__(self, timeout=1.0):
+        self.frames = {}  # frame_id -> list of parts
+        self.expected_parts = {}  # frame_id -> total_parts
+        self.timestamps = {}  # frame_id -> timestamp
+        self.timeout = timeout  # seconds
+
+    def construct_data(self, data: bytes):
+        now = time.time()
+
+        # Clean up old frames
+        self._cleanup_old_frames(now)
+
+        if len(data) < 3:
+            print("Invalid packet: too short")
+            return None
+
+        frame_id = data[0]
+        total_parts = data[1]
+        part_number = data[2]
+        payload = data[3:]
+
+        # Ignore invalid part numbers
+        if part_number >= total_parts:
+            print(f"Invalid part number {part_number} for frame {frame_id}")
+            return None
+
+        # Initialize frame if new
+        if frame_id not in self.frames:
+            self.frames[frame_id] = [None] * total_parts
+            self.expected_parts[frame_id] = total_parts
+            self.timestamps[frame_id] = now
+
+        # Store the part
+        self.frames[frame_id][part_number] = payload
+
+        # Check if all parts are received
+        if all(part is not None for part in self.frames[frame_id]):
+            full_payload = b''.join(self.frames[frame_id])
+
+            # Cleanup
+            del self.frames[frame_id]
+            del self.expected_parts[frame_id]
+            del self.timestamps[frame_id]
+
+            # print(f"Frame {frame_id} reassembled successfully.")
+            return full_payload
+
+        return None  # Not yet complete
+
+    def _cleanup_old_frames(self, current_time):
+        expired = [fid for fid, t in self.timestamps.items()
+                   if current_time - t > self.timeout]
+        for fid in expired:
+            print(f"Frame {fid} expired. Cleaning up.")
+            self.frames.pop(fid, None)
+            self.expected_parts.pop(fid, None)
+            self.timestamps.pop(fid, None)
 
 
 class App:
     def __init__(self, name):
         # Variables
-        self.stay_connected = False
+        self._stay_connected = False
         self._devices = [[], [], []]
+        self._data_assembler = BLEFrameAssembler()
+        self._assembled_data_count = 0
+        self._data_rate_start_time = 0
+        self._update_matrix = False
 
         # Tkinter
         self.root = tk.Tk()
@@ -95,7 +159,6 @@ class App:
         self._number_of_rows = None
         self._number_of_columns = None
         self._data_format = None
-        self._update_matrix = False
 
         # BLE Box
         self.ble_frame = create_widget(self.root, tk.Frame)
@@ -128,7 +191,7 @@ class App:
         self.root.mainloop()
 
     def _exit(self):
-        if self.stay_connected:
+        if self._stay_connected:
             self.disconnect_button_callback()
         self.root.destroy()
 
@@ -198,7 +261,7 @@ class App:
     async def _ble_connect_stream(self, device_address):
         try:
             async with (BleakClient(device_address) as client):
-                self.stay_connected = client.is_connected
+                self._stay_connected = client.is_connected
 
                 matrix_dimensions = await client.read_gatt_char(MATRIX_DIMENSIONS_CHARACTERISTIC_UUID)
                 self._number_of_rows, self._number_of_columns = decode_matrix_dimensions(matrix_dimensions)
@@ -206,7 +269,7 @@ class App:
                 self._start_time = time.time()
                 await client.start_notify(MATRIX_DATA_CHARACTERISTIC_UUID, self._notification_handler_callback)
 
-                while self.stay_connected:
+                while self._stay_connected:
                     await asyncio.sleep(0.01)
                     if time.time() - self._start_time >= 0.1:
                         self._update_matrix = True
@@ -214,7 +277,7 @@ class App:
                 if client.is_connected:
                     await client.stop_notify(MATRIX_DATA_CHARACTERISTIC_UUID)
                     await client.disconnect()
-                    self.root.after(0, self.connect_disconnect_buttons_state, self.stay_connected)
+                    self.root.after(0, self.connect_disconnect_buttons_state, self._stay_connected)
                     # noinspection PyTypeChecker
                     self.root.after(0, self.destroy_matrix)
         except Exception as e:
@@ -225,18 +288,28 @@ class App:
 
     # noinspection PyUnusedLocal
     def _notification_handler_callback(self, sender, data):
-        matrix_data = decode_matrix_data(data, self._number_of_rows, self._number_of_columns)
-        if self._update_matrix:
-            self._update_matrix = False
-            self._start_time = time.time()
-            # matrix_data = remap_matrix(matrix_data, 2048)
-            matrix_colours = self.matrix_canvas.match_colours(matrix_data)
-            self.root.after(0, self.matrix_canvas.update_matrix, matrix_colours)
-            # self.grid.plot_centre_of_pressure(matrix_data)
+        assembled_data = self._data_assembler.construct_data(data)
+        if assembled_data is not None:
+            matrix = decode_matrix_data(assembled_data, self._number_of_rows, self._number_of_columns)
+            if self._update_matrix:
+                self._update_matrix = False
+                self._start_time = time.time()
+                # matrix_data = remap_matrix(matrix_data, 2048)
+                matrix_colours = self.matrix_canvas.match_colours(matrix)
+                self.root.after(0, self.matrix_canvas.update_matrix, matrix_colours)
+                # self.grid.plot_centre_of_pressure(matrix_data)
+
+            self._assembled_data_count += 1
+            data_rate_time_difference = time.time() - self._data_rate_start_time
+            if data_rate_time_difference >= 5:
+                data_rate =  self._assembled_data_count / data_rate_time_difference
+                print("Data Rate: {:.2f}/s".format(data_rate))
+                self._data_rate_start_time = time.time()
+                self._assembled_data_count = 0
 
     # Function to disconnect from the connected device
     def disconnect_button_callback(self):
-        self.stay_connected = False
+        self._stay_connected = False
 
     # toggles the Connect, Disconnect and Search buttons
     def connect_disconnect_buttons_state(self, state):  # if true turn connect button off, disconnect on

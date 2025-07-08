@@ -59,7 +59,7 @@ def scale_tuple(input_tuple, x_scale, y_scale, total_rows, total_columns):
 
 def decode_matrix_dimensions(byte_array):
     num_of_rows, num_of_cols = struct.unpack('<BB', byte_array)
-    return num_of_cols, num_of_rows
+    return num_of_rows, num_of_cols
 
 
 def decode_matrix_data(byte_array, rows, columns):

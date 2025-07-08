@@ -7,9 +7,7 @@ import dearpygui.dearpygui as dpg
 from bleak import BleakScanner, BleakClient
 
 '''
-TODO: FPS Counter, Data Rate Counter
-Improve Update Matrix thread
-Improve Connect and Disconnect stages
+TODO: Data Rate Counter
 '''
 
 
@@ -170,11 +168,11 @@ class BLEScanner:
 
 
 class BLEConnection:
-    def __init__(self, address, create_matrix_callback, delete_matrix_callback):
-        self._create_matrix_cb = create_matrix_callback
-        self._delete_matrix_cb = delete_matrix_callback
-
+    def __init__(self, address):
+        self.matrix_dimensions_queue = Queue()
         self.matrix_data_queue = Queue()
+        self.connection_status = True
+
         self._dimensions_characteristic = MATRIX_DIMENSIONS_CHARACTERISTIC_UUID
         self._data_stream_characteristic = MATRIX_DATA_CHARACTERISTIC_UUID
         self._address = address
@@ -201,7 +199,7 @@ class BLEConnection:
         try:
             async with (BleakClient(self._address) as self._client):
                 self._rows, self._columns = await self._get_matrix_dimensions()
-                self._create_matrix_cb(self._rows, self._columns)
+                self.matrix_dimensions_queue.put((self._rows, self._columns))
                 self._start_times = time.time()
                 await self._client.start_notify(self._data_stream_characteristic, self._notification_handler_callback)
 
@@ -211,11 +209,12 @@ class BLEConnection:
                 if self._stop_event.is_set():
                     await self._client.stop_notify(MATRIX_DATA_CHARACTERISTIC_UUID)
                     await self._client.disconnect()
-                    self._delete_matrix_cb()
+                    self.connection_status = False
 
         except Exception as e:
             print("Connection Failed. Error: {}".format(e))
-            self._delete_matrix_cb()
+            self.connection_status = False
+            self.matrix_dimensions_queue.put((None, None))
 
     async def _get_matrix_dimensions(self):
         byte_array = await self._client.read_gatt_char(self._dimensions_characteristic)
@@ -249,9 +248,6 @@ class BLEConnection:
     def stop(self):
         self._stop_event.set()
         self._connection_thread.join()
-        with self.mutex:
-            while not self.matrix_data_queue.empty():
-                self.matrix_data_queue.get_nowait()
 
 
 class MatrixApp:
@@ -259,13 +255,19 @@ class MatrixApp:
         self._scanner = None
         self._device_table_items = {}
 
-        self._connecting_group = None
         self._connector = None
         self._colormap = None
         self._pressure_matrix = None
         self._pressure_matrix_group = None
         self._pressure_matrix_update_handler = None
+
+        self._animation_group = None
+
         self._last_gui_update = time.time()
+        self._frame_update_count = 0
+        self._frame_timestamp = None
+        self._fps_text = None
+        self._sps_text = None
 
     def setup_app(self):
         # GUI setup
@@ -286,12 +288,9 @@ class MatrixApp:
             with dpg.theme_component(dpg.mvAll):
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 12, category=dpg.mvThemeCat_Core)
 
-        with dpg.item_handler_registry() as self._pressure_matrix_update_handler:
-             dpg.add_item_visible_handler(callback=self.update_pressure_matrix_callback)
-
         dpg.set_primary_window("Primary Window", True)
         dpg.bind_theme(global_theme)
-
+        # dpg.show_metrics()
         dpg.setup_dearpygui()
         dpg.show_viewport()
         dpg.start_dearpygui()
@@ -346,47 +345,65 @@ class MatrixApp:
             dpg.delete_item(self._device_table_items[address][0])
             self._device_table_items.pop(address)
 
-    def create_pressure_matrix(self, rows, columns):
-        width = GRID_SIZE if columns > rows else round(GRID_SIZE * columns / rows)
-        height = round(GRID_SIZE * rows / columns) if columns > rows else GRID_SIZE
-        dpg.configure_viewport(0, width=115 + width, height=85 + GRID_SIZE)
-        values = [255] * rows * columns
+    def _create_pressure_matrix(self):
+        self._connecting_animation()
+        (rows, columns) = self._connector.matrix_dimensions_queue.get()
+        dpg.delete_item(self._animation_group)
 
-        with dpg.group(parent=self.window) as self._pressure_matrix_group:
-            dpg.add_button(label="Disconnect", width=120, callback=self.disconnect_from_device)
-            with dpg.group(horizontal=True):
-                color_map_scale = dpg.add_colormap_scale(min_scale=0, max_scale=255, height=GRID_SIZE, colormap=self._colormap)
-                with dpg.plot(before=color_map_scale, no_title=True, no_mouse_pos=True, no_inputs=True, height=height, width=width) as plot:
-                    dpg.bind_colormap(plot, self._colormap)
-                    dpg.add_plot_axis(dpg.mvXAxis, lock_min=True, lock_max=True, no_gridlines=True, no_tick_marks=True, no_label=True, no_tick_labels=True)
-                    with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True, lock_min=True, lock_max=True, no_label=True, no_tick_labels=True):
-                        self._pressure_matrix = dpg.add_heat_series(values, rows, columns, scale_min=0, scale_max=255, format="%.f")
+        if rows is not None or columns is not None:
+            width = GRID_SIZE if columns > rows else round(GRID_SIZE * columns / rows)
+            height = round(GRID_SIZE * rows / columns) if columns > rows else GRID_SIZE
+            dpg.configure_viewport(0, width=115 + width, height=85 + GRID_SIZE)
+            values = [0] * rows * columns
 
-        dpg.bind_item_handler_registry(self._pressure_matrix_group, self._pressure_matrix_update_handler)
+            with dpg.group(parent=self.window) as self._pressure_matrix_group:
+                with dpg.item_handler_registry() as self._pressure_matrix_update_handler:
+                    dpg.add_item_visible_handler(callback=self._update_pressure_matrix_callback)
+                with dpg.group(horizontal=True):
+                    dpg.add_button(label="Disconnect", width=120, callback=self._disconnect_from_device)
+                    self._fps_text = dpg.add_text("{:2d}".format(0))
+                    dpg.add_text("FPS,")
+                    self._data_rate_text = dpg.add_text("{:2d}".format(0))
+                    dpg.add_text("SPS")
+                with dpg.group(horizontal=True):
+                    color_map_scale = dpg.add_colormap_scale(min_scale=0, max_scale=255, height=GRID_SIZE, colormap=self._colormap)
+                    with dpg.plot(before=color_map_scale, no_title=True, no_mouse_pos=True, no_inputs=True, height=height, width=width) as plot:
+                        dpg.bind_colormap(plot, self._colormap)
+                        dpg.add_plot_axis(dpg.mvXAxis, lock_min=True, lock_max=True, no_gridlines=True, no_tick_marks=True, no_label=True, no_tick_labels=True)
+                        with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True, lock_min=True, lock_max=True, no_label=True, no_tick_labels=True):
+                            self._pressure_matrix = dpg.add_heat_series(values, rows, columns, scale_min=0, scale_max=255, format="%.f")
+
+            dpg.bind_item_handler_registry(self._pressure_matrix_group, self._pressure_matrix_update_handler)
+            self._frame_timestamp = 0
+            self._frame_counter = 0
+        else:
+            self._connector = None
+            self._create_device_scanning_table()
 
     # noinspection PyUnusedLocal
-    def update_pressure_matrix_callback(self, sender, app_data, user_data):
-        if self._pressure_matrix_group is not None:
-            now = time.time()
-            time_difference = now - self._last_gui_update
-            if time_difference >= 1 / MATRIX_FRAME_RATE:
-                self._last_gui_update = now
+    def _update_pressure_matrix_callback(self, sender, app_data, user_data):
+        if self._connector is not None:
+            if self._connector.connection_status:
                 latest_matrix_data = None
                 with self._connector.mutex:
-                    # Track queue size:
-                    # print(self._connector.matrix_data_queue.qsize() / time_difference)
                     while not self._connector.matrix_data_queue.empty():
                         latest_matrix_data = self._connector.matrix_data_queue.get_nowait()
-                        # process_matrix(latest_data)  could do data rate stuff here
                 if latest_matrix_data is not None:
                     dpg.set_value(self._pressure_matrix, [latest_matrix_data])
 
+                    # FPS counter
+                    self._frame_counter += 1
+                    time_difference = time.time() - self._frame_timestamp
+                    if time_difference >= 2.5:
+                        dpg.set_value(self._fps_text, "{:2d}".format(int(self._frame_counter / time_difference)))
+                        self._frame_counter = 0
+                        self._frame_timestamp = time.time()
+            else:
+                self._disconnect_from_device(None, None)
 
-    def remove_pressure_matrix(self):
-        if self._pressure_matrix_group:
-            dpg.delete_item(self._pressure_matrix_group)
-            self._pressure_matrix_group = None
-        self._create_device_scanning_table()
+    def _remove_pressure_matrix(self):
+        dpg.delete_item(self._pressure_matrix_group)
+        self._pressure_matrix_group = None
 
     # noinspection PyUnusedLocal
     def connect_to_device(self, sender, app_data, address):
@@ -394,21 +411,28 @@ class MatrixApp:
             dpg.disable_item(address_item)
             dpg.disable_item(name_item)
         self._remove_device_scanning_table()
-        self._connector = BLEConnection(address, self.create_pressure_matrix, self.remove_pressure_matrix)
+        self._connector = BLEConnection(address)
         self._connector.start()
+        self._create_pressure_matrix()
 
-    def connecting_animation(self, address):
-        with dpg.add_group(parent=self.window) as self._connecting_group:
-            dpg.add_text("Attempting to connect to device:")
-            dpg.add_text(address)
+    def _connecting_animation(self):
+        with dpg.group(parent=self.window) as self._animation_group:
+            dpg.add_text("Connecting...")
+            dpg.add_loading_indicator(indent=35, radius=15)
 
     # noinspection PyUnusedLocal
-    def disconnect_from_device(self, sender, app_data):
+    def _disconnect_from_device(self, sender, app_data):
+        self._remove_pressure_matrix()
+        self._disconnecting_animation()
         self._connector.stop()
         self._connector = None
+        dpg.delete_item(self._animation_group)
+        self._create_device_scanning_table()
 
-    #def disconnect_animation(self):
-
+    def _disconnecting_animation(self):
+        with dpg.group(parent=self.window) as self._animation_group:
+            dpg.add_text("Disconnecting...")
+            dpg.add_loading_indicator(indent=45, radius=25)
 
     def _on_close(self):
         if self._scanner is not None:

@@ -2,8 +2,9 @@ import time
 import struct
 import asyncio
 import threading
-from bleak import BleakScanner, BleakClient
+from queue import Queue
 import dearpygui.dearpygui as dpg
+from bleak import BleakScanner, BleakClient
 
 '''
 TODO: FPS Counter, Data Rate Counter
@@ -19,6 +20,8 @@ MATRIX_DIMENSIONS_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1624").lower(
 MATRIX_DATA_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1625").lower()
 TIMEOUT_SECONDS = 20  # How long to wait until removing a last seen device
 GRID_SIZE = 500
+MATRIX_FRAME_RATE = 30
+
 
 COLOUR_MAP_VALUES = [
     ( 13,  22, 135, 255), ( 45,  25, 148, 255), ( 66,  29, 158, 255), ( 90,  32, 165, 255), (112,  34, 168, 255),
@@ -167,11 +170,11 @@ class BLEScanner:
 
 
 class BLEConnection:
-    def __init__(self, address, create_matrix_callback, update_matrix_callback, delete_matrix_callback):
+    def __init__(self, address, create_matrix_callback, delete_matrix_callback):
         self._create_matrix_cb = create_matrix_callback
-        self._update_matrix_cb = update_matrix_callback
         self._delete_matrix_cb = delete_matrix_callback
 
+        self.matrix_data_queue = Queue()
         self._dimensions_characteristic = MATRIX_DIMENSIONS_CHARACTERISTIC_UUID
         self._data_stream_characteristic = MATRIX_DATA_CHARACTERISTIC_UUID
         self._address = address
@@ -186,6 +189,7 @@ class BLEConnection:
 
         self._loop = asyncio.new_event_loop()
         self._stop_event = threading.Event()
+        self.mutex = threading.Lock()
 
         self._connection_thread = threading.Thread(target=self._run_loop, daemon=True)
 
@@ -202,9 +206,7 @@ class BLEConnection:
                 await self._client.start_notify(self._data_stream_characteristic, self._notification_handler_callback)
 
                 while not self._stop_event.is_set():
-                    await asyncio.sleep(0.003)
-                    if time.time() - self._start_time >= 0.033:
-                        self._update_matrix = True
+                    await asyncio.sleep(0.1)
 
                 if self._stop_event.is_set():
                     await self._client.stop_notify(MATRIX_DATA_CHARACTERISTIC_UUID)
@@ -230,11 +232,8 @@ class BLEConnection:
         assembled_data = self._data_assembler.construct_data(data)
         if assembled_data is not None:
             matrix_values = self._decode_matrix_data(assembled_data)
-            if self._update_matrix:
-                self._update_matrix = False
-                self._start_time = time.time()
-                self._update_matrix_cb(matrix_values)
-                # self.grid.plot_centre_of_pressure(matrix_data)
+            with self.mutex:
+                self.matrix_data_queue.put(matrix_values)
 
             self._assembled_data_count += 1
             data_rate_time_difference = time.time() - self._data_rate_start_time
@@ -250,6 +249,9 @@ class BLEConnection:
     def stop(self):
         self._stop_event.set()
         self._connection_thread.join()
+        with self.mutex:
+            while not self.matrix_data_queue.empty():
+                self.matrix_data_queue.get_nowait()
 
 
 class MatrixApp:
@@ -262,6 +264,8 @@ class MatrixApp:
         self._colormap = None
         self._pressure_matrix = None
         self._pressure_matrix_group = None
+        self._pressure_matrix_update_handler = None
+        self._last_gui_update = time.time()
 
     def setup_app(self):
         # GUI setup
@@ -281,6 +285,9 @@ class MatrixApp:
         with dpg.theme() as global_theme:
             with dpg.theme_component(dpg.mvAll):
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 12, category=dpg.mvThemeCat_Core)
+
+        with dpg.item_handler_registry() as self._pressure_matrix_update_handler:
+             dpg.add_item_visible_handler(callback=self.update_pressure_matrix_callback)
 
         dpg.set_primary_window("Primary Window", True)
         dpg.bind_theme(global_theme)
@@ -355,8 +362,25 @@ class MatrixApp:
                     with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True, lock_min=True, lock_max=True, no_label=True, no_tick_labels=True):
                         self._pressure_matrix = dpg.add_heat_series(values, rows, columns, scale_min=0, scale_max=255, format="%.f")
 
-    def update_pressure_matrix(self, values):
-        dpg.set_value(self._pressure_matrix, [values])
+        dpg.bind_item_handler_registry(self._pressure_matrix_group, self._pressure_matrix_update_handler)
+
+    # noinspection PyUnusedLocal
+    def update_pressure_matrix_callback(self, sender, app_data, user_data):
+        if self._pressure_matrix_group is not None:
+            now = time.time()
+            time_difference = now - self._last_gui_update
+            if time_difference >= 1 / MATRIX_FRAME_RATE:
+                self._last_gui_update = now
+                latest_matrix_data = None
+                with self._connector.mutex:
+                    # Track queue size:
+                    # print(self._connector.matrix_data_queue.qsize() / time_difference)
+                    while not self._connector.matrix_data_queue.empty():
+                        latest_matrix_data = self._connector.matrix_data_queue.get_nowait()
+                        # process_matrix(latest_data)  could do data rate stuff here
+                if latest_matrix_data is not None:
+                    dpg.set_value(self._pressure_matrix, [latest_matrix_data])
+
 
     def remove_pressure_matrix(self):
         if self._pressure_matrix_group:
@@ -370,7 +394,7 @@ class MatrixApp:
             dpg.disable_item(address_item)
             dpg.disable_item(name_item)
         self._remove_device_scanning_table()
-        self._connector = BLEConnection(address, self.create_pressure_matrix, self.update_pressure_matrix, self.remove_pressure_matrix)
+        self._connector = BLEConnection(address, self.create_pressure_matrix, self.remove_pressure_matrix)
         self._connector.start()
 
     def connecting_animation(self, address):
@@ -383,10 +407,14 @@ class MatrixApp:
         self._connector.stop()
         self._connector = None
 
+    #def disconnect_animation(self):
+
 
     def _on_close(self):
         if self._scanner is not None:
             self._scanner.stop()
+        if self._connector is not None:
+            self._connector.stop()
         print("GUI Closed Safely")
 
 

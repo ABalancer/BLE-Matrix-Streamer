@@ -6,10 +6,6 @@ from queue import Queue
 import dearpygui.dearpygui as dpg
 from bleak import BleakScanner, BleakClient
 
-'''
-TODO: Data Rate Counter
-'''
-
 
 # noinspection SpellCheckingInspection
 BASE_UUID = "4A98XXXX-E7C1-EFDE-C757-F1267DD021E8"
@@ -30,7 +26,7 @@ COLOUR_MAP_VALUES = [
 
 
 class BLEFrameAssembler:
-    def __init__(self, timeout=1.0):
+    def __init__(self, timeout=1):
         self.frames = {}  # frame_id -> list of parts
         self.expected_parts = {}  # frame_id -> total_parts
         self.timestamps = {}  # frame_id -> timestamp
@@ -171,7 +167,7 @@ class BLEConnection:
     def __init__(self, address):
         self.matrix_dimensions_queue = Queue()
         self.matrix_data_queue = Queue()
-        self.connection_status = True
+        self._connection_status = True
 
         self._dimensions_characteristic = MATRIX_DIMENSIONS_CHARACTERISTIC_UUID
         self._data_stream_characteristic = MATRIX_DATA_CHARACTERISTIC_UUID
@@ -180,10 +176,10 @@ class BLEConnection:
         self._rows = None
         self._columns = None
         self._data_assembler = BLEFrameAssembler()
-        self._update_matrix = False
+
         self._data_rate_start_time = 0
         self._assembled_data_count = 0
-        self._start_time = 0
+        self._data_rate = 0
 
         self._loop = asyncio.new_event_loop()
         self._stop_event = threading.Event()
@@ -200,7 +196,7 @@ class BLEConnection:
             async with (BleakClient(self._address) as self._client):
                 self._rows, self._columns = await self._get_matrix_dimensions()
                 self.matrix_dimensions_queue.put((self._rows, self._columns))
-                self._start_times = time.time()
+                self._data_rate_start_time = time.time()
                 await self._client.start_notify(self._data_stream_characteristic, self._notification_handler_callback)
 
                 while not self._stop_event.is_set():
@@ -209,12 +205,14 @@ class BLEConnection:
                 if self._stop_event.is_set():
                     await self._client.stop_notify(MATRIX_DATA_CHARACTERISTIC_UUID)
                     await self._client.disconnect()
-                    self.connection_status = False
+                    with self.mutex:
+                        self._connection_status = False
 
         except Exception as e:
             print("Connection Failed. Error: {}".format(e))
-            self.connection_status = False
-            self.matrix_dimensions_queue.put((None, None))
+            with self.mutex:
+                self._connection_status = False
+                self.matrix_dimensions_queue.put((None, None))
 
     async def _get_matrix_dimensions(self):
         byte_array = await self._client.read_gatt_char(self._dimensions_characteristic)
@@ -234,13 +232,24 @@ class BLEConnection:
             with self.mutex:
                 self.matrix_data_queue.put(matrix_values)
 
-            self._assembled_data_count += 1
-            data_rate_time_difference = time.time() - self._data_rate_start_time
-            if data_rate_time_difference >= 5:
-                data_rate = self._assembled_data_count / data_rate_time_difference
-                print("Data Rate: {:.2f}/s".format(data_rate))
-                self._data_rate_start_time = time.time()
-                self._assembled_data_count = 0
+            self._calculate_data_rate()
+
+    def _calculate_data_rate(self):
+        self._assembled_data_count += 1
+        data_rate_time_difference = time.time() - self._data_rate_start_time
+        if data_rate_time_difference > 1:
+            with self.mutex:
+                self._data_rate = self._assembled_data_count / data_rate_time_difference
+            self._data_rate_start_time = time.time()
+            self._assembled_data_count = 0
+
+    def get_data_rate(self):
+        with self.mutex:
+            return self._data_rate
+
+    def get_connection_status(self):
+        with self.mutex:
+            return self._connection_status
 
     def start(self):
         self._connection_thread.start()
@@ -248,6 +257,7 @@ class BLEConnection:
     def stop(self):
         self._stop_event.set()
         self._connection_thread.join()
+        print("Successfully exited BLEConnection thread")
 
 
 class MatrixApp:
@@ -303,7 +313,7 @@ class MatrixApp:
             dpg.add_text("Scanning for Bluetooth Devices")
             with dpg.table(header_row=True, scrollY=True, resizable=False, reorderable=False, hideable=False,
                            borders_innerV=True, borders_innerH=True, borders_outerH=True, borders_outerV=True) as self.device_table_rows:
-                dpg.add_table_column(label="Address", width_fixed=True)
+                dpg.add_table_column(label="Address", width_fixed=True, init_width_or_weight=153)
                 dpg.add_table_column(label="Device")
 
         self._scanner = BLEScanner(self.add_row_to_table, self.update_row_in_table, self.delete_row_in_table)
@@ -345,7 +355,7 @@ class MatrixApp:
             dpg.delete_item(self._device_table_items[address][0])
             self._device_table_items.pop(address)
 
-    def _create_pressure_matrix(self):
+    def _create_matrix_display(self):
         self._connecting_animation()
         (rows, columns) = self._connector.matrix_dimensions_queue.get()
         dpg.delete_item(self._animation_group)
@@ -358,11 +368,11 @@ class MatrixApp:
 
             with dpg.group(parent=self.window) as self._pressure_matrix_group:
                 with dpg.item_handler_registry() as self._pressure_matrix_update_handler:
-                    dpg.add_item_visible_handler(callback=self._update_pressure_matrix_callback)
+                    dpg.add_item_visible_handler(callback=self._update_matrix_display_callback)
                 with dpg.group(horizontal=True):
                     dpg.add_button(label="Disconnect", width=120, callback=self._disconnect_from_device)
                     self._fps_text = dpg.add_text("{:2d}".format(0))
-                    dpg.add_text("FPS,")
+                    dpg.add_text("FPS |")
                     self._data_rate_text = dpg.add_text("{:2d}".format(0))
                     dpg.add_text("SPS")
                 with dpg.group(horizontal=True):
@@ -381,25 +391,35 @@ class MatrixApp:
             self._create_device_scanning_table()
 
     # noinspection PyUnusedLocal
-    def _update_pressure_matrix_callback(self, sender, app_data, user_data):
+    def _update_matrix_display_callback(self, sender, app_data, user_data):
         if self._connector is not None:
-            if self._connector.connection_status:
-                latest_matrix_data = None
-                with self._connector.mutex:
-                    while not self._connector.matrix_data_queue.empty():
-                        latest_matrix_data = self._connector.matrix_data_queue.get_nowait()
-                if latest_matrix_data is not None:
-                    dpg.set_value(self._pressure_matrix, [latest_matrix_data])
+            if self._connector._connection_status:
+                self._update_pressure_matrix()
+                self._update_fps_data_rate()
 
-                    # FPS counter
-                    self._frame_counter += 1
-                    time_difference = time.time() - self._frame_timestamp
-                    if time_difference >= 2.5:
-                        dpg.set_value(self._fps_text, "{:2d}".format(int(self._frame_counter / time_difference)))
-                        self._frame_counter = 0
-                        self._frame_timestamp = time.time()
             else:
                 self._disconnect_from_device(None, None)
+
+    def _update_pressure_matrix(self):
+        latest_matrix_data = None
+        with self._connector.mutex:
+            while not self._connector.matrix_data_queue.empty():
+                latest_matrix_data = self._connector.matrix_data_queue.get_nowait()
+        if latest_matrix_data is not None:
+            dpg.set_value(self._pressure_matrix, [latest_matrix_data])
+
+    def _update_fps_data_rate(self):
+        # FPS Counter
+        self._frame_counter += 1
+        time_difference = time.time() - self._frame_timestamp
+        if time_difference >= 1:
+            dpg.set_value(self._fps_text, "{:2.1f}".format(self._frame_counter / time_difference))
+            self._frame_counter = 0
+            self._frame_timestamp = time.time()
+
+        # Data Rate counter
+        data_frequency = self._connector.get_data_rate()
+        dpg.set_value(self._data_rate_text, "{:3.1f}".format(data_frequency))
 
     def _remove_pressure_matrix(self):
         dpg.delete_item(self._pressure_matrix_group)
@@ -413,7 +433,7 @@ class MatrixApp:
         self._remove_device_scanning_table()
         self._connector = BLEConnection(address)
         self._connector.start()
-        self._create_pressure_matrix()
+        self._create_matrix_display()
 
     def _connecting_animation(self):
         with dpg.group(parent=self.window) as self._animation_group:

@@ -79,7 +79,7 @@ class BLEFrameAssembler:
         expired = [fid for fid, t in self.timestamps.items()
                    if current_time - t > self.timeout]
         for fid in expired:
-            print(f"Frame {fid} expired. Cleaning up.")
+            #print(f"Frame {fid} expired. Cleaning up.")
             self.frames.pop(fid, None)
             self.expected_parts.pop(fid, None)
             self.timestamps.pop(fid, None)

@@ -393,7 +393,7 @@ class MatrixApp:
     # noinspection PyUnusedLocal
     def _update_matrix_display_callback(self, sender, app_data, user_data):
         if self._connector is not None:
-            if self._connector._connection_status:
+            if self._connector.get_connection_status():
                 self._update_pressure_matrix()
                 self._update_fps_data_rate()
 

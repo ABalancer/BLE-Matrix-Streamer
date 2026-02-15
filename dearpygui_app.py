@@ -2,6 +2,7 @@ import time
 import struct
 import asyncio
 import threading
+import numpy as np
 from queue import Queue
 import dearpygui.dearpygui as dpg
 from bleak import BleakScanner, BleakClient
@@ -222,7 +223,8 @@ class BLEConnection:
     def _decode_matrix_data(self, byte_array):
         # Unpack the byte array into a flat list of integers
         unpacked_matrix_data = struct.unpack("<" + (self._rows * self._columns * "B"), byte_array)
-        return unpacked_matrix_data
+        matrix_data = np.array(unpacked_matrix_data).reshape(self._rows, self._columns)
+        return matrix_data
 
     # noinspection PyUnusedLocal
     def _notification_handler_callback(self, sender, data):
@@ -285,7 +287,7 @@ class MatrixApp:
         dpg.create_viewport(title='BLE Matrix Streamer', vsync=True, resizable=False, small_icon="./icon.ico", large_icon="./icon_png.png")
 
         with dpg.font_registry():
-            regular_font = dpg.add_font(file="./JetBrainsMono-Regular.ttf", size=20)
+            regular_font = dpg.add_font(file="../MotorLogger/JetBrainsMono-Regular.ttf", size=20)
 
         with (dpg.colormap_registry()):
             self._colormap = dpg.add_colormap(colors=COLOUR_MAP_VALUES, qualitative=False)
@@ -401,12 +403,17 @@ class MatrixApp:
                 self._disconnect_from_device(None, None)
 
     def _update_pressure_matrix(self):
-        latest_matrix_data = None
+        latest_matrix = None
         with self._connector.mutex:
             while not self._connector.matrix_data_queue.empty():
-                latest_matrix_data = self._connector.matrix_data_queue.get_nowait()
-        if latest_matrix_data is not None:
-            dpg.set_value(self._pressure_matrix, [latest_matrix_data])
+                latest_matrix = self._connector.matrix_data_queue.get_nowait()
+        if latest_matrix is not None:
+            #transposed_matrix = np.flipud(latest_matrix)
+            #transposed_matrix = np.fliplr(latest_matrix)
+            #transposed_matrix = latest_matrix.T
+            transposed_matrix = latest_matrix
+            flat_matrix = transposed_matrix.flatten().tolist()
+            dpg.set_value(self._pressure_matrix, [flat_matrix])
 
     def _update_fps_data_rate(self):
         # FPS Counter

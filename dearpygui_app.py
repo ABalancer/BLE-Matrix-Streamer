@@ -267,9 +267,10 @@ class MatrixApp:
         self._scanner = None
         self._device_table_items = {}
 
+        self._global_theme = None
         self._connector = None
         self._colormap = None
-        self._pressure_matrix = None
+        self._pressure_matrix_plot = None
         self._pressure_matrix_group = None
         self._pressure_matrix_update_handler = None
 
@@ -280,6 +281,11 @@ class MatrixApp:
         self._frame_timestamp = None
         self._fps_text = None
         self._sps_text = None
+
+        # For CoP computations
+        self._matrix_shape = None
+        self._xs = None
+        self._ys = None
 
     def setup_app(self):
         # GUI setup
@@ -296,12 +302,17 @@ class MatrixApp:
             dpg.bind_font(regular_font)
             self._create_device_scanning_table()
 
-        with dpg.theme() as global_theme:
+        with dpg.theme() as self._global_theme:
             with dpg.theme_component(dpg.mvAll):
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 12, category=dpg.mvThemeCat_Core)
 
+            with dpg.theme_component(dpg.mvScatterSeries):
+                # change line/marker colour for the CoP (RGBA)
+                dpg.add_theme_color(
+                    dpg.mvPlotCol_Line,(30, 156, 67, 153), category=dpg.mvThemeCat_Plots)
+
         dpg.set_primary_window("Primary Window", True)
-        dpg.bind_theme(global_theme)
+        dpg.bind_theme(self._global_theme)
         # dpg.show_metrics()
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -357,12 +368,18 @@ class MatrixApp:
             dpg.delete_item(self._device_table_items[address][0])
             self._device_table_items.pop(address)
 
+    def _precompute_cop_matrix(self, rows, columns):
+        self._matrix_shape = (rows, columns)
+        self._ys, self._xs = np.indices(self._matrix_shape)
+
     def _create_matrix_display(self):
         self._connecting_animation()
         (rows, columns) = self._connector.matrix_dimensions_queue.get()
         dpg.delete_item(self._animation_group)
 
         if rows is not None or columns is not None:
+            self._precompute_cop_matrix(rows, columns)
+
             width = GRID_SIZE if columns > rows else round(GRID_SIZE * columns / rows)
             height = round(GRID_SIZE * rows / columns) if columns > rows else GRID_SIZE
             dpg.configure_viewport(0, width=115 + width, height=85 + GRID_SIZE)
@@ -378,12 +395,25 @@ class MatrixApp:
                     self._data_rate_text = dpg.add_text("{:2d}".format(0))
                     dpg.add_text("SPS")
                 with dpg.group(horizontal=True):
-                    color_map_scale = dpg.add_colormap_scale(min_scale=0, max_scale=255, height=GRID_SIZE, colormap=self._colormap)
+                    color_map_scale = dpg.add_colormap_scale(
+                        min_scale=0, max_scale=255, height=GRID_SIZE, colormap=self._colormap)
                     with dpg.plot(before=color_map_scale, no_title=True, no_mouse_pos=True, no_inputs=True, height=height, width=width) as plot:
                         dpg.bind_colormap(plot, self._colormap)
-                        dpg.add_plot_axis(dpg.mvXAxis, lock_min=True, lock_max=True, no_gridlines=True, no_tick_marks=True, no_label=True, no_tick_labels=True)
+                        dpg.add_plot_axis(
+                            dpg.mvXAxis,
+                            lock_min=True,
+                            lock_max=True,
+                            no_gridlines=True,
+                            no_tick_marks=True,
+                            no_label=True,
+                            no_tick_labels=True)
                         with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True, lock_min=True, lock_max=True, no_label=True, no_tick_labels=True):
-                            self._pressure_matrix = dpg.add_heat_series(values, rows, columns, scale_min=0, scale_max=255, format="%.f")
+                            self._pressure_matrix_plot = dpg.add_heat_series(values, rows, columns, scale_min=0, scale_max=255, format="%.f")
+
+                        with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True, lock_min=True,
+                                           lock_max=True, no_label=True, no_tick_labels=True):
+                            self._cop_plot = dpg.add_scatter_series(
+                                [0.5], [0.5], tag="cop_dot")
 
             dpg.bind_item_handler_registry(self._pressure_matrix_group, self._pressure_matrix_update_handler)
             self._frame_timestamp = 0
@@ -398,9 +428,25 @@ class MatrixApp:
             if self._connector.get_connection_status():
                 self._update_pressure_matrix()
                 self._update_fps_data_rate()
-
             else:
                 self._disconnect_from_device(None, None)
+
+    def _compute_cop(self, matrix):
+        total = matrix.sum()
+        if total == 0:
+            return 1.1, 1.1  # plots in a non-visible location
+
+        rows = self._matrix_shape[0]
+        columns = self._matrix_shape[1]
+
+        x_idx = (self._xs * matrix).sum() / total
+        y_idx = (self._ys * matrix).sum() / total
+
+        x_norm = (x_idx + 0.5) / columns if columns > 1 else 0.5
+        y_norm = (y_idx + 0.5) / rows if rows > 1 else 0.5
+
+        # re-adjust y_norm to be positioned correctly on the plot
+        return x_norm, 1.0 - y_norm
 
     def _update_pressure_matrix(self):
         latest_matrix = None
@@ -413,7 +459,9 @@ class MatrixApp:
             #transposed_matrix = latest_matrix.T
             transposed_matrix = latest_matrix
             flat_matrix = transposed_matrix.flatten().tolist()
-            dpg.set_value(self._pressure_matrix, [flat_matrix])
+            cop_x, cop_y = self._compute_cop(transposed_matrix)
+            dpg.set_value(self._cop_plot, [cop_x, cop_y])
+            dpg.set_value(self._pressure_matrix_plot, [flat_matrix])
 
     def _update_fps_data_rate(self):
         # FPS Counter

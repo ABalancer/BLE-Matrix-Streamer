@@ -293,7 +293,7 @@ class MatrixApp:
         dpg.create_viewport(title='BLE Matrix Streamer', vsync=True, resizable=False, small_icon="./icon.ico", large_icon="./icon_png.png")
 
         with dpg.font_registry():
-            regular_font = dpg.add_font(file="../MotorLogger/JetBrainsMono-Regular.ttf", size=20)
+            regular_font = dpg.add_font(file="./JetBrainsMono-Regular.ttf", size=20)
 
         with (dpg.colormap_registry()):
             self._colormap = dpg.add_colormap(colors=COLOUR_MAP_VALUES, qualitative=False)

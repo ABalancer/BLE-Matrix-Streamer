@@ -13,6 +13,7 @@ BASE_UUID = "4A98XXXX-E7C1-EFDE-C757-F1267DD021E8"
 MATRIX_SERVICE_UUID = BASE_UUID.replace("XXXX", "1623").lower()
 MATRIX_DIMENSIONS_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1624").lower()
 MATRIX_DATA_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1625").lower()
+MATRIX_TARE_CHARACTERISTIC_UUID = BASE_UUID.replace("XXXX", "1626").lower()
 TIMEOUT_SECONDS = 20  # How long to wait until removing a last seen device
 GRID_SIZE = 500
 MATRIX_FRAME_RATE = 30
@@ -47,7 +48,7 @@ class BLEFrameAssembler:
         total_parts = data[1]
         part_number = data[2]
         payload = data[3:]
-
+        # print(data[0], data[1], data[2], [data[x] for x in range(3, len(data))])
         # Ignore invalid part numbers
         if part_number >= total_parts:
             print(f"Invalid part number {part_number} for frame {frame_id}")
@@ -168,10 +169,10 @@ class BLEConnection:
     def __init__(self, address):
         self.matrix_dimensions_queue = Queue()
         self.matrix_data_queue = Queue()
-        self._connection_status = True
 
         self._dimensions_characteristic = MATRIX_DIMENSIONS_CHARACTERISTIC_UUID
         self._data_stream_characteristic = MATRIX_DATA_CHARACTERISTIC_UUID
+        self._tare_characteristic = MATRIX_TARE_CHARACTERISTIC_UUID
         self._address = address
 
         self._rows = None
@@ -206,19 +207,28 @@ class BLEConnection:
                 if self._stop_event.is_set():
                     await self._client.stop_notify(MATRIX_DATA_CHARACTERISTIC_UUID)
                     await self._client.disconnect()
-                    with self.mutex:
-                        self._connection_status = False
 
         except Exception as e:
             print("Connection Failed. Error: {}".format(e))
             with self.mutex:
-                self._connection_status = False
                 self.matrix_dimensions_queue.put((None, None))
 
     async def _get_matrix_dimensions(self):
         byte_array = await self._client.read_gatt_char(self._dimensions_characteristic)
         rows, columns = struct.unpack('<BB', byte_array)
         return rows, columns
+
+    def send_tare_command(self):
+        asyncio.run(self._send_tare_command())
+
+    async def _send_tare_command(self):
+        if self._client.is_connected:
+            # Command: 0x01 = tare
+            data = bytearray([0x01])
+            await self._client.write_gatt_char(self._tare_characteristic, data, response=False)
+            print("Tare command sent")
+        else:
+            print("Device is not connected")
 
     def _decode_matrix_data(self, byte_array):
         # Unpack the byte array into a flat list of integers
@@ -251,7 +261,7 @@ class BLEConnection:
 
     def get_connection_status(self):
         with self.mutex:
-            return self._connection_status
+            return self._client.is_connected
 
     def start(self):
         self._connection_thread.start()
@@ -390,6 +400,7 @@ class MatrixApp:
                     dpg.add_item_visible_handler(callback=self._update_matrix_display_callback)
                 with dpg.group(horizontal=True):
                     dpg.add_button(label="Disconnect", width=120, callback=self._disconnect_from_device)
+                    dpg.add_button(label="Tare", width=120, callback=self._tare_pressure_matrix)
                     self._fps_text = dpg.add_text("{:2d}".format(0))
                     dpg.add_text("FPS |")
                     self._data_rate_text = dpg.add_text("{:2d}".format(0))
@@ -397,7 +408,8 @@ class MatrixApp:
                 with dpg.group(horizontal=True):
                     color_map_scale = dpg.add_colormap_scale(
                         min_scale=0, max_scale=255, height=GRID_SIZE, colormap=self._colormap)
-                    with dpg.plot(before=color_map_scale, no_title=True, no_mouse_pos=True, no_inputs=True, height=height, width=width) as plot:
+                    with dpg.plot(before=color_map_scale, no_title=True, no_mouse_pos=True,
+                                  no_inputs=True, height=height, width=width) as plot:
                         dpg.bind_colormap(plot, self._colormap)
                         dpg.add_plot_axis(
                             dpg.mvXAxis,
@@ -407,8 +419,10 @@ class MatrixApp:
                             no_tick_marks=True,
                             no_label=True,
                             no_tick_labels=True)
-                        with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True, lock_min=True, lock_max=True, no_label=True, no_tick_labels=True):
-                            self._pressure_matrix_plot = dpg.add_heat_series(values, rows, columns, scale_min=0, scale_max=255, format="%.f")
+                        with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True,
+                                           lock_min=True, lock_max=True, no_label=True, no_tick_labels=True):
+                            self._pressure_matrix_plot = dpg.add_heat_series(values, rows, columns,
+                                                                             scale_min=0, scale_max=255, format="%.f")
 
                         with dpg.plot_axis(dpg.mvYAxis, no_gridlines=True, no_tick_marks=True, lock_min=True,
                                            lock_max=True, no_label=True, no_tick_labels=True):
@@ -434,7 +448,7 @@ class MatrixApp:
     def _compute_cop(self, matrix):
         total = matrix.sum()
         if total == 0:
-            return 1.1, 1.1  # plots in a non-visible location
+            return [np.float64(1.1), np.float64(1.1)]
 
         rows = self._matrix_shape[0]
         columns = self._matrix_shape[1]
@@ -446,7 +460,7 @@ class MatrixApp:
         y_norm = (y_idx + 0.5) / rows if rows > 1 else 0.5
 
         # re-adjust y_norm to be positioned correctly on the plot
-        return x_norm, 1.0 - y_norm
+        return [x_norm, 1.0 - y_norm]
 
     def _update_pressure_matrix(self):
         latest_matrix = None
@@ -459,9 +473,11 @@ class MatrixApp:
             #transposed_matrix = latest_matrix.T
             transposed_matrix = latest_matrix
             flat_matrix = transposed_matrix.flatten().tolist()
-            cop_x, cop_y = self._compute_cop(transposed_matrix)
-            dpg.set_value(self._cop_plot, [cop_x, cop_y])
+            cop = self._compute_cop(transposed_matrix)
             dpg.set_value(self._pressure_matrix_plot, [flat_matrix])
+            dpg.set_value(self._cop_plot, cop)
+            #else:
+                #dpg.set_value(self._cop_plot, [-1.0, -1.0])
 
     def _update_fps_data_rate(self):
         # FPS Counter
@@ -479,6 +495,10 @@ class MatrixApp:
     def _remove_pressure_matrix(self):
         dpg.delete_item(self._pressure_matrix_group)
         self._pressure_matrix_group = None
+
+    def _tare_pressure_matrix(self):
+        if self._connector is not None:
+            self._connector.send_tare_command()
 
     # noinspection PyUnusedLocal
     def connect_to_device(self, sender, app_data, address):
